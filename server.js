@@ -22,7 +22,7 @@ mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/naturalpo
     .catch((err) => console.error("Error MongoDB:", err));
 
 // Configuracion JWT
-const JWT_SECRET = process.env.JWT_SECRET || "clave_secreta_por_defecto";
+const JWT_SECRET = process.env.JWT_SECRET || "CAMBIA_ESTA_CLAVE_A_UNA_SEGURA";
 const TOKEN_EXPIRES = "8h";
 
 // Blacklist en memoria
@@ -58,6 +58,16 @@ const typeDefs = gql`
 
     union Perfil = Cliente | Empleado
 
+    type ClienteData {
+        nombre: String!
+        email: String!
+        direccion: String
+        comuna: String
+        provincia: String
+        region: String
+        telefono: String
+    }
+
     type Cliente {
         id: ID!
         rut: String!
@@ -65,6 +75,13 @@ const typeDefs = gql`
         email: String!
         pass: String!
         estado: String!
+        direccion: String
+        comuna: String
+        provincia: String
+        region: String
+        fechaNacimiento: String
+        sexo: String
+        telefono: String
     }
 
     type Empleado {
@@ -110,6 +127,7 @@ const typeDefs = gql`
         cuponUsado: String
         descuentoAplicado: Int
         totalPagado: Int
+        clienteData: ClienteData
     }
 
     type Reembolso {
@@ -173,8 +191,34 @@ const typeDefs = gql`
 
         addUsuario(nombre: String!, email: String!, pass: String!, rut: String!, perfilTipo: String!): Usuario
 
-        addCliente(rut: String!, nombre: String!, email: String!, pass: String!): Cliente
-        updateClienteCompleto(rut: String!, nombre: String!, email: String!, estado: String!): Cliente
+        addCliente(
+            rut: String!, 
+            nombre: String!, 
+            email: String!, 
+            pass: String!,
+            direccion: String,
+            comuna: String,
+            provincia: String,
+            region: String,
+            fechaNacimiento: String,
+            sexo: String,
+            telefono: String
+        ): Cliente
+        
+        updateClienteCompleto(
+            rut: String!, 
+            nombre: String!, 
+            email: String!, 
+            estado: String!,
+            direccion: String,
+            comuna: String,
+            provincia: String,
+            region: String,
+            fechaNacimiento: String,
+            sexo: String,
+            telefono: String
+        ): Cliente
+        
         updateCliente(rut: String!, estado: String!): Cliente
         deleteCliente(rut: String!): Response
 
@@ -242,26 +286,163 @@ const resolvers = {
         getCarritoByCliente: (_, { clienteId }) =>
             Carrito.findOne({ clienteId }).exec(),
 
-        getCompraByCliente: (_, { rut }) =>
-            Compra.find({ clienteId: rut }).sort({ fecha: -1 }).exec(),
+        getCompraByCliente: async (_, { rut }) => {
+            try {
+                const compras = await Compra.find({ clienteId: rut }).sort({ fecha: -1 }).exec();
+                
+                const comprasConCliente = await Promise.all(
+                    compras.map(async (compra) => {
+                        if (!compra) return null;
+                        
+                        const cliente = await Cliente.findOne({ rut: compra.clienteId }).exec();
+                        return {
+                            id: compra._id ? compra._id.toString() : '',
+                            clienteId: compra.clienteId || '',
+                            total: compra.total || 0,
+                            totalPagado: compra.totalPagado || compra.total || 0,
+                            descuentoAplicado: compra.descuentoAplicado || 0,
+                            cuponUsado: compra.cuponUsado || null,
+                            fecha: compra.fecha ? compra.fecha.toISOString() : new Date().toISOString(),
+                            items: compra.items ? compra.items.map(item => ({
+                                productoId: item.productoId ? item.productoId.toString() : '',
+                                cantidad: item.cantidad || 0
+                            })) : [],
+                            clienteData: cliente ? {
+                                nombre: cliente.nombre || '',
+                                email: cliente.email || '',
+                                direccion: cliente.direccion || '',
+                                comuna: cliente.comuna || '',
+                                provincia: cliente.provincia || '',
+                                region: cliente.region || '',
+                                telefono: cliente.telefono || ''
+                            } : {
+                                nombre: '',
+                                email: '',
+                                direccion: '',
+                                comuna: '',
+                                provincia: '',
+                                region: '',
+                                telefono: ''
+                            }
+                        };
+                    })
+                );
+                
+                return comprasConCliente.filter(compra => compra !== null);
+            } catch (error) {
+                console.error('Error en getCompraByCliente:', error);
+                return [];
+            }
+        },
 
-        getCompras: (_, __, { user }) => {
+        getCompras: async (_, __, { user }) => {
             if (!user || user.perfilTipo !== 'Empleado')
                 throw new Error("Acceso denegado");
-            return Compra.find().sort({ fecha: -1 }).exec();
+            
+            try {
+                const compras = await Compra.find().sort({ fecha: -1 }).exec();
+                
+                const comprasConCliente = await Promise.all(
+                    compras.map(async (compra) => {
+                        if (!compra) return null;
+                        
+                        const cliente = await Cliente.findOne({ rut: compra.clienteId }).exec();
+                        return {
+                            id: compra._id ? compra._id.toString() : '',
+                            clienteId: compra.clienteId || '',
+                            total: compra.total || 0,
+                            totalPagado: compra.totalPagado || compra.total || 0,
+                            descuentoAplicado: compra.descuentoAplicado || 0,
+                            cuponUsado: compra.cuponUsado || null,
+                            fecha: compra.fecha ? compra.fecha.toISOString() : new Date().toISOString(),
+                            items: compra.items ? compra.items.map(item => ({
+                                productoId: item.productoId ? item.productoId.toString() : '',
+                                cantidad: item.cantidad || 0
+                            })) : [],
+                            clienteData: cliente ? {
+                                nombre: cliente.nombre || '',
+                                email: cliente.email || '',
+                                direccion: cliente.direccion || '',
+                                comuna: cliente.comuna || '',
+                                provincia: cliente.provincia || '',
+                                region: cliente.region || '',
+                                telefono: cliente.telefono || ''
+                            } : {
+                                nombre: '',
+                                email: '',
+                                direccion: '',
+                                comuna: '',
+                                provincia: '',
+                                region: '',
+                                telefono: ''
+                            }
+                        };
+                    })
+                );
+                
+                return comprasConCliente.filter(compra => compra !== null);
+            } catch (error) {
+                console.error('Error en getCompras:', error);
+                throw new Error("Error obteniendo compras");
+            }
         },
 
         getComprasDelDia: async (_, __, { user }) => {
             if (!user || user.perfilTipo !== 'Empleado')
                 throw new Error("Acceso denegado");
 
-            const now = new Date();
-            const inicio = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-            const fin = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+            try {
+                const now = new Date();
+                const inicio = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                const fin = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
 
-            return Compra.find({ 
-                fecha: { $gte: inicio, $lt: fin } 
-            }).sort({ fecha: 1 }).exec();
+                const compras = await Compra.find({ 
+                    fecha: { $gte: inicio, $lt: fin } 
+                }).sort({ fecha: 1 }).exec();
+                
+                const comprasConCliente = await Promise.all(
+                    compras.map(async (compra) => {
+                        if (!compra) return null;
+                        
+                        const cliente = await Cliente.findOne({ rut: compra.clienteId }).exec();
+                        return {
+                            id: compra._id ? compra._id.toString() : '',
+                            clienteId: compra.clienteId || '',
+                            total: compra.total || 0,
+                            totalPagado: compra.totalPagado || compra.total || 0,
+                            descuentoAplicado: compra.descuentoAplicado || 0,
+                            cuponUsado: compra.cuponUsado || null,
+                            fecha: compra.fecha ? compra.fecha.toISOString() : new Date().toISOString(),
+                            items: compra.items ? compra.items.map(item => ({
+                                productoId: item.productoId ? item.productoId.toString() : '',
+                                cantidad: item.cantidad || 0
+                            })) : [],
+                            clienteData: cliente ? {
+                                nombre: cliente.nombre || '',
+                                email: cliente.email || '',
+                                direccion: cliente.direccion || '',
+                                comuna: cliente.comuna || '',
+                                provincia: cliente.provincia || '',
+                                region: cliente.region || '',
+                                telefono: cliente.telefono || ''
+                            } : {
+                                nombre: '',
+                                email: '',
+                                direccion: '',
+                                comuna: '',
+                                provincia: '',
+                                region: '',
+                                telefono: ''
+                            }
+                        };
+                    })
+                );
+                
+                return comprasConCliente.filter(compra => compra !== null);
+            } catch (error) {
+                console.error('Error en getComprasDelDia:', error);
+                throw new Error("Error obteniendo compras del día");
+            }
         },
 
         getReembolsos: () => Reembolso.find().exec(),
@@ -431,7 +612,14 @@ const resolvers = {
                 nombre: String(args.nombre),
                 email: String(args.email),
                 pass: hashed,
-                estado: 'pendiente'
+                estado: 'pendiente',
+                direccion: args.direccion ? String(args.direccion) : '',
+                comuna: args.comuna ? String(args.comuna) : '',
+                provincia: args.provincia ? String(args.provincia) : '',
+                region: args.region ? String(args.region) : '',
+                fechaNacimiento: args.fechaNacimiento ? new Date(args.fechaNacimiento) : null,
+                sexo: args.sexo ? String(args.sexo) : '',
+                telefono: args.telefono ? String(args.telefono) : ''
             });
             
             await Usuario.create({
@@ -665,7 +853,11 @@ const resolvers = {
             return cliente;
         },
 
-        updateClienteCompleto: async (_, { rut, nombre, email, estado }) => {
+        updateClienteCompleto: async (_, { 
+            rut, nombre, email, estado,
+            direccion, comuna, provincia, region,
+            fechaNacimiento, sexo, telefono 
+        }) => {
             if (!['pendiente', 'activo', 'rechazado'].includes(estado)) {
                 throw new Error("Estado inválido. Use: pendiente, activo o rechazado");
             }
@@ -683,7 +875,14 @@ const resolvers = {
                 { 
                     nombre: String(nombre), 
                     email: String(email), 
-                    estado: String(estado) 
+                    estado: String(estado),
+                    direccion: direccion ? String(direccion) : '',
+                    comuna: comuna ? String(comuna) : '',
+                    provincia: provincia ? String(provincia) : '',
+                    region: region ? String(region) : '',
+                    fechaNacimiento: fechaNacimiento ? new Date(fechaNacimiento) : null,
+                    sexo: sexo ? String(sexo) : '',
+                    telefono: telefono ? String(telefono) : ''
                 },
                 { new: true }
             ).exec();
@@ -920,7 +1119,19 @@ const resolvers = {
             carrito.totalConDescuento = 0;
             await carrito.save();
 
-            return compra;
+            return {
+                id: compra._id.toString(),
+                clienteId: compra.clienteId,
+                total: compra.total,
+                totalPagado: compra.totalPagado,
+                descuentoAplicado: compra.descuentoAplicado,
+                cuponUsado: compra.cuponUsado,
+                fecha: compra.fecha.toISOString(),
+                items: compra.items.map(item => ({
+                    productoId: item.productoId.toString(),
+                    cantidad: item.cantidad
+                }))
+            };
         }
     }
 };
@@ -960,6 +1171,15 @@ async function start() {
             } catch {
                 return { user: null, req };
             }
+        },
+        // Agregar manejo de errores mejorado
+        formatError: (error) => {
+            console.error('GraphQL Error:', error);
+            return {
+                message: error.message,
+                locations: error.locations,
+                path: error.path
+            };
         }
     });
 
