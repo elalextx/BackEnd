@@ -12,6 +12,18 @@ const carritoSchema = new mongoose.Schema({
         required: true,
         default: 0,
         min: 0
+    },
+    cuponAplicado: {
+        type: String,
+        default: null
+    },
+    descuento: {
+        type: Number,
+        default: 0
+    },
+    totalConDescuento: {
+        type: Number,
+        default: 0
     }
 });
 

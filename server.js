@@ -4,6 +4,7 @@ const cors = require('cors');
 const { ApolloServer, gql } = require('apollo-server-express');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+require('dotenv').config();
 
 // Modelos
 const Usuario = require('./models/usuario');
@@ -13,19 +14,24 @@ const Producto = require('./models/producto');
 const Carrito = require('./models/carrito');
 const Compra = require('./models/compra'); 
 const Reembolso = require('./models/reembolso');
+const Cupon = require('./models/cupon');
 
 // Conexion MongoDB
-mongoose.connect("mongodb://localhost:27017/naturalpower")
+mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/naturalpower")
     .then(() => console.log("MongoDB conectado"))
     .catch((err) => console.error("Error MongoDB:", err));
 
 // Configuracion JWT
-const JWT_SECRET = process.env.JWT_SECRET || "CAMBIA_ESTA_CLAVE_A_UNA_SEGURA";
+const JWT_SECRET = process.env.JWT_SECRET || "clave_secreta_por_defecto";
 const TOKEN_EXPIRES = "8h";
 
 // Blacklist en memoria
 const blacklist = new Set();
 
+// Rate limiting en memoria para login
+const loginAttempts = new Map();
+const LOGIN_MAX_ATTEMPTS = 10;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutos
 
 // Esquema GraphQL
 const typeDefs = gql`
@@ -90,6 +96,9 @@ const typeDefs = gql`
         clienteId: String!
         items: [ItemCarrito]!
         total: Int!
+        cuponAplicado: String
+        descuento: Int
+        totalConDescuento: Int
     }
 
     type Compra {
@@ -98,6 +107,9 @@ const typeDefs = gql`
         total: Int!
         fecha: String!
         items: [ItemCarrito]!
+        cuponUsado: String
+        descuentoAplicado: Int
+        totalPagado: Int
     }
 
     type Reembolso {
@@ -105,6 +117,27 @@ const typeDefs = gql`
         compraId: String!
         motivo: String!
         estado: String!
+    }
+    
+    type Cupon {
+        id: ID!
+        codigo: String!
+        porcentaje: Int!
+        descuentoFijo: Int
+        tipo: String!
+        fechaInicio: String!
+        fechaFin: String!
+        usosMaximos: Int!
+        usosActuales: Int!
+        activo: Boolean!
+        minimoCompra: Int!
+    }
+
+    type CuponValidacion {
+        valido: Boolean!
+        mensaje: String!
+        cupon: Cupon
+        descuento: Int
     }
 
     # QUERIES
@@ -125,6 +158,10 @@ const typeDefs = gql`
         getComprasDelDia: [Compra]
 
         getReembolsos: [Reembolso]
+
+        getCupones: [Cupon]
+        getCupon(codigo: String!): Cupon
+        validarCupon(codigo: String!, clienteId: String!): CuponValidacion
     }
 
     # MUTATIONS
@@ -155,6 +192,11 @@ const typeDefs = gql`
 
         solicitarReembolso(compraId: String!, motivo: String!): Reembolso
         atenderReembolso(id: ID!, estado: String!): Reembolso
+
+        crearCupon(codigo: String!, porcentaje: Int!, tipo: String!, fechaInicio: String!, fechaFin: String!, usosMaximos: Int!, minimoCompra: Int, descuentoFijo: Int): Cupon
+        aplicarCupon(codigo: String!, clienteId: String!): Carrito
+        removerCupon(clienteId: String!): Carrito
+        deleteCupon(id: ID!): Response
 
     }
 `;
@@ -222,20 +264,124 @@ const resolvers = {
             }).sort({ fecha: 1 }).exec();
         },
 
-        getReembolsos: () => Reembolso.find().exec()
+        getReembolsos: () => Reembolso.find().exec(),
+
+        getCupones: async (_, __, { user }) => {
+            if (!user || user.perfilTipo !== 'Empleado') {
+                throw new Error("Acceso denegado");
+            }
+            return await Cupon.find().sort({ fechaInicio: -1 }).exec();
+        },
+
+        getCupon: async (_, { codigo }, { user }) => {
+            if (!user || user.perfilTipo !== 'Empleado') {
+                throw new Error("Acceso denegado");
+            }
+            return await Cupon.findOne({ codigo: codigo.toUpperCase() }).exec();
+        },
+
+        validarCupon: async (_, { codigo, clienteId }) => {
+            const cupon = await Cupon.findOne({ codigo: codigo.toUpperCase() }).exec();
+            
+            if (!cupon) {
+                return { valido: false, mensaje: "Cupón no encontrado" };
+            }
+            
+            if (!cupon.activo) {
+                return { valido: false, mensaje: "Cupón inactivo" };
+            }
+            
+            const ahora = new Date();
+            if (ahora < cupon.fechaInicio) {
+                return { valido: false, mensaje: "Cupón aún no disponible" };
+            }
+            
+            if (ahora > cupon.fechaFin) {
+                return { valido: false, mensaje: "Cupón expirado" };
+            }
+            
+            if (cupon.usosActuales >= cupon.usosMaximos) {
+                return { valido: false, mensaje: "Cupón agotado" };
+            }
+            
+            const carrito = await Carrito.findOne({ clienteId }).exec();
+            if (!carrito) {
+                return { 
+                    valido: false, 
+                    mensaje: "Carrito vacío" 
+                };
+            }
+            
+            if (carrito.total < cupon.minimoCompra) {
+                return { 
+                    valido: false, 
+                    mensaje: `Mínimo de compra: $${cupon.minimoCompra}` 
+                };
+            }
+            
+            let descuento = 0;
+            if (cupon.tipo === 'porcentaje') {
+                descuento = Math.round(carrito.total * (cupon.porcentaje / 100));
+            } else {
+                descuento = cupon.descuentoFijo || 0;
+            }
+            
+            return {
+                valido: true,
+                mensaje: "Cupón válido",
+                cupon,
+                descuento
+            };
+        },        
     },
 
     Mutation: {
 
-        login: async (_, { email, pass }) => {
-            const usuario = await Usuario.findOne({ email }).populate("perfil").exec();
-            if (!usuario) throw new Error("Credenciales incorrectas");
+        login: async (_, { email, pass }, { req }) => {
+            const ip = req?.ip || 'local';
+            const now = Date.now();
+            
+            if (loginAttempts.has(ip)) {
+                const attempt = loginAttempts.get(ip);
+                if (now - attempt.timestamp > LOGIN_WINDOW_MS) {
+                    loginAttempts.delete(ip);
+                } else if (attempt.count >= LOGIN_MAX_ATTEMPTS) {
+                    throw new Error("Demasiados intentos de login. Espere 15 minutos.");
+                }
+            }
+            
+            if (!email || typeof email !== 'string' || email.length > 100) {
+                throw new Error("Email inválido");
+            }
+            
+            if (!pass || typeof pass !== 'string' || pass.length > 100) {
+                throw new Error("Contraseña inválida");
+            }
+            
+            const usuario = await Usuario.findOne({ email: String(email) }).populate("perfil").exec();
+            if (!usuario) {
+                const currentAttempt = loginAttempts.get(ip) || { count: 0, timestamp: now };
+                currentAttempt.count++;
+                currentAttempt.timestamp = now;
+                loginAttempts.set(ip, currentAttempt);
+                
+                throw new Error("Credenciales incorrectas");
+            }
 
             let ok = false;
             if (usuario.pass.startsWith("$2")) ok = await bcrypt.compare(pass, usuario.pass);
             else ok = (usuario.pass === pass);
 
-            if (!ok) throw new Error("Credenciales incorrectas");
+            if (!ok) {
+                const currentAttempt = loginAttempts.get(ip) || { count: 0, timestamp: now };
+                currentAttempt.count++;
+                currentAttempt.timestamp = now;
+                loginAttempts.set(ip, currentAttempt);
+                
+                throw new Error("Credenciales incorrectas");
+            }
+
+            loginAttempts.delete(ip);
 
             const payload = {
                 id: usuario.id,
@@ -262,21 +408,37 @@ const resolvers = {
         },
 
         addCliente: async (_, args) => {
+            if (!args.rut || !/^[0-9]{7,8}-[0-9kK]{1}$/.test(args.rut)) {
+                throw new Error("Formato de RUT inválido. Use: 12345678-9");
+            }
+            
+            if (!args.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(args.email)) {
+                throw new Error("Email inválido");
+            }
+            
+            if (!args.nombre || args.nombre.trim().length < 2) {
+                throw new Error("Nombre debe tener al menos 2 caracteres");
+            }
+            
+            if (!args.pass || args.pass.length < 6) {
+                throw new Error("Contraseña debe tener al menos 6 caracteres");
+            }
+            
             const hashed = await bcrypt.hash(args.pass, 10);
             
             const cliente = await Cliente.create({
-                rut: args.rut,
-                nombre: args.nombre,
-                email: args.email,
+                rut: String(args.rut),
+                nombre: String(args.nombre),
+                email: String(args.email),
                 pass: hashed,
                 estado: 'pendiente'
             });
             
             await Usuario.create({
-                nombre: args.nombre,
-                email: args.email,
+                nombre: String(args.nombre),
+                email: String(args.email),
                 pass: hashed,
-                rut: args.rut,
+                rut: String(args.rut),
                 perfilTipo: 'Cliente',
                 perfil: cliente._id
             });
@@ -285,21 +447,41 @@ const resolvers = {
         },
 
         addEmpleado: async (_, args) => {
+            if (!args.rut || !/^[0-9]{7,8}-[0-9kK]{1}$/.test(args.rut)) {
+                throw new Error("Formato de RUT inválido. Use: 12345678-9");
+            }
+            
+            if (!args.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(args.email)) {
+                throw new Error("Email inválido");
+            }
+            
+            if (!args.nombre || args.nombre.trim().length < 2) {
+                throw new Error("Nombre debe tener al menos 2 caracteres");
+            }
+            
+            if (!args.pass || args.pass.length < 6) {
+                throw new Error("Contraseña debe tener al menos 6 caracteres");
+            }
+            
+            if (!args.cargo || args.cargo.trim().length < 2) {
+                throw new Error("Cargo debe tener al menos 2 caracteres");
+            }
+            
             const hashed = await bcrypt.hash(args.pass, 10);
             
             const empleado = await Empleado.create({
-                rut: args.rut,
-                nombre: args.nombre,
-                email: args.email,
+                rut: String(args.rut),
+                nombre: String(args.nombre),
+                email: String(args.email),
                 pass: hashed,
-                cargo: args.cargo
+                cargo: String(args.cargo)
             });
             
             await Usuario.create({
-                nombre: args.nombre,
-                email: args.email,
+                nombre: String(args.nombre),
+                email: String(args.email),
                 pass: hashed,
-                rut: args.rut,
+                rut: String(args.rut),
                 perfilTipo: 'Empleado',
                 perfil: empleado._id
             });
@@ -307,10 +489,39 @@ const resolvers = {
             return empleado;
         },
 
-        addProducto: (_, args) => Producto.create(args),
+        addProducto: (_, args) => {
+            if (!args.nombre || args.nombre.trim().length < 2) {
+                throw new Error("Nombre del producto inválido");
+            }
+            
+            if (args.precio < 0) {
+                throw new Error("Precio no puede ser negativo");
+            }
+            
+            if (args.stock < 0) {
+                throw new Error("Stock no puede ser negativo");
+            }
+            
+            return Producto.create({
+                ...args,
+                nombre: String(args.nombre),
+                categoria: String(args.categoria || ''),
+                descripcion: args.descripcion ? String(args.descripcion) : '',
+                imagen: args.imagen ? String(args.imagen) : ''
+            });
+        },
 
-        updateProducto: (_, { id, ...rest }) =>
-            Producto.findByIdAndUpdate(id, rest, { new: true }).exec(),
+        updateProducto: (_, { id, ...rest }) => {
+            if (rest.precio !== undefined && rest.precio < 0) {
+                throw new Error("Precio no puede ser negativo");
+            }
+            
+            if (rest.stock !== undefined && rest.stock < 0) {
+                throw new Error("Stock no puede ser negativo");
+            }
+            
+            return Producto.findByIdAndUpdate(id, rest, { new: true }).exec();
+        },
 
         deleteProducto: async (_, { id }) => {
             await Producto.findByIdAndDelete(id).exec();
@@ -319,7 +530,7 @@ const resolvers = {
 
         crearCarrito: async (_, { clienteId }) => {
             return Carrito.findOneAndUpdate(
-                { clienteId },
+                { clienteId: String(clienteId) },
                 { $setOnInsert: { items: [], total: 0 } },
                 { upsert: true, new: true }
             ).exec();
@@ -330,17 +541,19 @@ const resolvers = {
                 throw new Error("La cantidad debe ser al menos 1");
             }
 
-            let carrito = await Carrito.findOne({ clienteId }).exec();
+            let carrito = await Carrito.findOne({ clienteId: String(clienteId) }).exec();
             
             if (!carrito) {
                 carrito = await Carrito.create({ 
-                    clienteId, 
+                    clienteId: String(clienteId), 
                     items: [], 
-                    total: 0 
+                    total: 0,
+                    descuento: 0,
+                    totalConDescuento: 0
                 });
             }
 
-            const producto = await Producto.findById(productoId).exec();
+            const producto = await Producto.findById(String(productoId)).exec();
             if (!producto) throw new Error("Producto no encontrado");
             
             const itemExistente = carrito.items.find(item => 
@@ -357,19 +570,308 @@ const resolvers = {
             if (itemExistente) {
                 itemExistente.cantidad += cantidad;
             } else {
-                carrito.items.push({ productoId, cantidad });
+                carrito.items.push({ productoId: String(productoId), cantidad });
+            }
+
+            let nuevoTotal = 0;
+            for (const item of carrito.items) {
+                const prod = await Producto.findById(item.productoId).exec();
+                if (prod) {
+                    nuevoTotal += prod.precio * item.cantidad;
+                }
+            }
+            
+            carrito.total = nuevoTotal;
+            
+            if (carrito.cuponAplicado) {
+                const cupon = await Cupon.findOne({ codigo: carrito.cuponAplicado }).exec();
+                if (cupon && cupon.activo) {
+                    let descuentoCalculado = 0;
+                    if (cupon.tipo === 'porcentaje') {
+                        descuentoCalculado = Math.round(carrito.total * (cupon.porcentaje / 100));
+                    } else {
+                        descuentoCalculado = cupon.descuentoFijo || 0;
+                    }
+                    
+                    descuentoCalculado = Math.min(descuentoCalculado, carrito.total);
+                    carrito.descuento = descuentoCalculado;
+                    carrito.totalConDescuento = carrito.total - descuentoCalculado;
+                } else {
+                    carrito.cuponAplicado = null;
+                    carrito.descuento = 0;
+                    carrito.totalConDescuento = carrito.total;
+                }
+            } else {
+                carrito.totalConDescuento = carrito.total;
             }
 
             await carrito.save();
+            
             return carrito;
         },
 
+        solicitarReembolso: (_, args) => {
+            if (!args.motivo || args.motivo.trim().length < 10) {
+                throw new Error("El motivo debe tener al menos 10 caracteres");
+            }
+            
+            return Reembolso.create({ 
+                ...args, 
+                compraId: String(args.compraId),
+                motivo: String(args.motivo),
+                estado: "Pendiente" 
+            });
+        },
+
+        atenderReembolso: (_, { id, estado }) => {
+            if (!['Aprobado', 'Rechazado'].includes(estado)) {
+                throw new Error("Estado inválido. Use: Aprobado o Rechazado");
+            }
+            
+            return Reembolso.findByIdAndUpdate(id, { estado: String(estado) }, { new: true }).exec();
+        },
+
+        resetPassword: async (_, { email, newPass }) => {
+            if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                return { status: "400", message: "Email inválido" };
+            }
+            
+            if (!newPass || newPass.length < 6) {
+                return { status: "400", message: "Contraseña debe tener al menos 6 caracteres" };
+            }
+            
+            const usuario = await Usuario.findOne({ email: String(email) }).exec();
+            if (!usuario)
+                return { status: "404", message: "Usuario no encontrado" };
+
+            const hashed = await bcrypt.hash(newPass, 10);
+            usuario.pass = hashed;
+            await usuario.save();
+
+            return { status: "200", message: "Contraseña actualizada" };
+        },
+
+        updateCliente: async (_, { rut, estado }) => {
+            if (!['pendiente', 'activo', 'rechazado'].includes(estado)) {
+                throw new Error("Estado inválido. Use: pendiente, activo o rechazado");
+            }
+            
+            const cliente = await Cliente.findOneAndUpdate(
+                { rut: String(rut) },
+                { estado: String(estado) },
+                { new: true }
+            ).exec();
+            if (!cliente) throw new Error("Cliente no encontrado");
+            return cliente;
+        },
+
+        updateClienteCompleto: async (_, { rut, nombre, email, estado }) => {
+            if (!['pendiente', 'activo', 'rechazado'].includes(estado)) {
+                throw new Error("Estado inválido. Use: pendiente, activo o rechazado");
+            }
+            
+            if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                throw new Error("Email inválido");
+            }
+            
+            if (!nombre || nombre.trim().length < 2) {
+                throw new Error("Nombre debe tener al menos 2 caracteres");
+            }
+            
+            const cliente = await Cliente.findOneAndUpdate(
+                { rut: String(rut) },
+                { 
+                    nombre: String(nombre), 
+                    email: String(email), 
+                    estado: String(estado) 
+                },
+                { new: true }
+            ).exec();
+            
+            if (!cliente) throw new Error("Cliente no encontrado");
+            
+            await Usuario.findOneAndUpdate(
+                { rut: String(rut), perfilTipo: 'Cliente' },
+                { 
+                    nombre: String(nombre), 
+                    email: String(email) 
+                },
+                { new: true }
+            ).exec();
+            
+            return cliente;
+        },
+
+        updateEmpleadoCompleto: async (_, { rut, nombre, email, cargo }) => {
+            if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                throw new Error("Email inválido");
+            }
+            
+            if (!nombre || nombre.trim().length < 2) {
+                throw new Error("Nombre debe tener al menos 2 caracteres");
+            }
+            
+            if (!cargo || cargo.trim().length < 2) {
+                throw new Error("Cargo debe tener al menos 2 caracteres");
+            }
+            
+            const empleado = await Empleado.findOneAndUpdate(
+                { rut: String(rut) },
+                { 
+                    nombre: String(nombre), 
+                    email: String(email), 
+                    cargo: String(cargo) 
+                },
+                { new: true }
+            ).exec();
+            
+            if (!empleado) throw new Error("Empleado no encontrado");
+            
+            await Usuario.findOneAndUpdate(
+                { rut: String(rut), perfilTipo: 'Empleado' },
+                { 
+                    nombre: String(nombre), 
+                    email: String(email) 
+                },
+                { new: true }
+            ).exec();
+            
+            return empleado;
+        },
+
+        deleteCliente: async (_, { rut }) => {
+            const cliente = await Cliente.findOne({ rut: String(rut) }).exec();
+            if (!cliente) throw new Error("Cliente no encontrado");
+            
+            await Usuario.findOneAndDelete({ 
+                rut: String(rut), 
+                perfilTipo: 'Cliente' 
+            }).exec();
+            
+            await Cliente.findOneAndDelete({ rut: String(rut) }).exec();
+            
+            return { status: "200", message: "Cliente eliminado correctamente" };
+        },
+
+        deleteEmpleado: async (_, { rut }) => {
+            const empleado = await Empleado.findOne({ rut: String(rut) }).exec();
+            if (!empleado) throw new Error("Empleado no encontrado");
+            
+            await Usuario.findOneAndDelete({ 
+                rut: String(rut), 
+                perfilTipo: 'Empleado' 
+            }).exec();
+            
+            await Empleado.findOneAndDelete({ rut: String(rut) }).exec();
+            
+            return { status: "200", message: "Empleado eliminado correctamente" };
+        },
+
+        crearCupon: async (_, args, { user }) => {
+            if (!user || user.perfilTipo !== 'Empleado') {
+                throw new Error("Acceso denegado");
+            }
+            
+            const cuponExistente = await Cupon.findOne({ 
+                codigo: String(args.codigo).toUpperCase() 
+            }).exec();
+            
+            if (cuponExistente) {
+                throw new Error("El código ya existe");
+            }
+            
+            const fechaInicio = new Date(args.fechaInicio);
+            const fechaFin = new Date(args.fechaFin);
+            
+            if (fechaFin <= fechaInicio) {
+                throw new Error("La fecha fin debe ser posterior a la fecha inicio");
+            }
+            
+            return await Cupon.create({
+                ...args,
+                codigo: String(args.codigo).toUpperCase(),
+                usosActuales: 0,
+                activo: true
+            });
+        },
+
+        aplicarCupon: async (_, { codigo, clienteId }) => {
+            const validacion = await resolvers.Query.validarCupon(null, { 
+                codigo: String(codigo), 
+                clienteId: String(clienteId) 
+            });
+            
+            if (!validacion.valido) {
+                throw new Error(validacion.mensaje);
+            }
+            
+            const carrito = await Carrito.findOne({ clienteId: String(clienteId) }).exec();
+            if (!carrito) {
+                throw new Error("Carrito no encontrado");
+            }
+            
+            if (carrito.cuponAplicado) {
+                throw new Error("Ya tienes un cupón aplicado. Remuévelo primero.");
+            }
+            
+            let descuento = 0;
+            if (validacion.cupon.tipo === 'porcentaje') {
+                descuento = Math.round(carrito.total * (validacion.cupon.porcentaje / 100));
+            } else {
+                descuento = validacion.cupon.descuentoFijo || 0;
+            }
+            
+            descuento = Math.min(descuento, carrito.total);
+            
+            carrito.cuponAplicado = validacion.cupon.codigo;
+            carrito.descuento = descuento;
+            carrito.totalConDescuento = carrito.total - descuento;
+            
+            await carrito.save();
+            
+            return carrito;
+        },
+
+        removerCupon: async (_, { clienteId }) => {
+            const carrito = await Carrito.findOne({ clienteId: String(clienteId) }).exec();
+            if (!carrito) {
+                throw new Error("Carrito no encontrado");
+            }
+            
+            if (!carrito.cuponAplicado) {
+                throw new Error("No hay cupón aplicado");
+            }
+            
+            carrito.cuponAplicado = null;
+            carrito.descuento = 0;
+            carrito.totalConDescuento = carrito.total;
+            
+            await carrito.save();
+            
+            return carrito;
+        },
+
+        deleteCupon: async (_, { id }, { user }) => {
+            if (!user || user.perfilTipo !== 'Empleado') {
+                throw new Error("Acceso denegado");
+            }
+            
+            const cupon = await Cupon.findById(id).exec();
+            if (!cupon) {
+                throw new Error("Cupón no encontrado");
+            }
+            
+            await Cupon.findByIdAndDelete(id).exec();
+            
+            return { status: "200", message: "Cupón eliminado correctamente" };
+        },
+
         confirmarCompra: async (_, { clienteId }) => {
-            const cliente = await Cliente.findOne({ rut: clienteId }).exec();
+            const cliente = await Cliente.findOne({ rut: String(clienteId) }).exec();
             if (!cliente) throw new Error("Cliente no encontrado");
             if (cliente.estado === 'rechazado') throw new Error("Cliente rechazado no puede realizar compras");
 
-            const carrito = await Carrito.findOne({ clienteId }).exec();
+            const carrito = await Carrito.findOne({ clienteId: String(clienteId) }).exec();
             if (!carrito || carrito.items.length === 0)
                 throw new Error("Carrito vacío");
 
@@ -382,11 +884,11 @@ const resolvers = {
             }
 
             let total = 0;
+            let totalAPagar = carrito.totalConDescuento || carrito.total;
             
             for (const item of carrito.items) {
                 const prod = await Producto.findById(item.productoId).exec();
                 if (prod) {
-                    // Restar del stock
                     prod.stock -= item.cantidad;
                     await prod.save();
                     
@@ -395,109 +897,30 @@ const resolvers = {
             }
 
             const compra = await Compra.create({
-                clienteId,
-                total,
+                clienteId: String(clienteId),
+                total: carrito.total,
+                totalPagado: totalAPagar,
+                descuentoAplicado: carrito.descuento || 0,
+                cuponUsado: carrito.cuponAplicado || null,
                 fecha: new Date(),
                 items: carrito.items
             });
 
+            if (carrito.cuponAplicado) {
+                await Cupon.findOneAndUpdate(
+                    { codigo: carrito.cuponAplicado },
+                    { $inc: { usosActuales: 1 } }
+                ).exec();
+            }
+
             carrito.items = [];
             carrito.total = 0;
+            carrito.cuponAplicado = null;
+            carrito.descuento = 0;
+            carrito.totalConDescuento = 0;
             await carrito.save();
 
             return compra;
-        },
-
-        solicitarReembolso: (_, args) =>
-            Reembolso.create({ ...args, estado: "Pendiente" }),
-
-        atenderReembolso: (_, { id, estado }) =>
-            Reembolso.findByIdAndUpdate(id, { estado }, { new: true }).exec(),
-
-        resetPassword: async (_, { email, newPass }) => {
-            const usuario = await Usuario.findOne({ email }).exec();
-            if (!usuario)
-                return { status: "404", message: "Usuario no encontrado" };
-
-            const hashed = await bcrypt.hash(newPass, 10);
-            usuario.pass = hashed;
-            await usuario.save();
-
-            return { status: "200", message: "Contraseña actualizada" };
-        },
-
-        updateCliente: async (_, { rut, estado }) => {
-            const cliente = await Cliente.findOneAndUpdate(
-                { rut },
-                { estado },
-                { new: true }
-            ).exec();
-            if (!cliente) throw new Error("Cliente no encontrado");
-            return cliente;
-        },
-
-        updateClienteCompleto: async (_, { rut, nombre, email, estado }) => {
-            const cliente = await Cliente.findOneAndUpdate(
-                { rut },
-                { nombre, email, estado },
-                { new: true }
-            ).exec();
-            
-            if (!cliente) throw new Error("Cliente no encontrado");
-            
-            await Usuario.findOneAndUpdate(
-                { rut, perfilTipo: 'Cliente' },
-                { nombre, email },
-                { new: true }
-            ).exec();
-            
-            return cliente;
-        },
-
-        updateEmpleadoCompleto: async (_, { rut, nombre, email, cargo }) => {
-            const empleado = await Empleado.findOneAndUpdate(
-                { rut },
-                { nombre, email, cargo },
-                { new: true }
-            ).exec();
-            
-            if (!empleado) throw new Error("Empleado no encontrado");
-            
-            await Usuario.findOneAndUpdate(
-                { rut, perfilTipo: 'Empleado' },
-                { nombre, email },
-                { new: true }
-            ).exec();
-            
-            return empleado;
-        },
-
-        deleteCliente: async (_, { rut }) => {
-            const cliente = await Cliente.findOne({ rut }).exec();
-            if (!cliente) throw new Error("Cliente no encontrado");
-            
-            await Usuario.findOneAndDelete({ 
-                rut, 
-                perfilTipo: 'Cliente' 
-            }).exec();
-            
-            await Cliente.findOneAndDelete({ rut }).exec();
-            
-            return { status: "200", message: "Cliente eliminado correctamente" };
-        },
-
-        deleteEmpleado: async (_, { rut }) => {
-            const empleado = await Empleado.findOne({ rut }).exec();
-            if (!empleado) throw new Error("Empleado no encontrado");
-            
-            await Usuario.findOneAndDelete({ 
-                rut, 
-                perfilTipo: 'Empleado' 
-            }).exec();
-            
-            await Empleado.findOneAndDelete({ rut }).exec();
-            
-            return { status: "200", message: "Empleado eliminado correctamente" };
         }
     }
 };
@@ -506,6 +929,14 @@ const resolvers = {
 async function start() {
 
     const app = express();
+
+    // Headers de seguridad
+    app.use((req, res, next) => {
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('X-Frame-Options', 'DENY');
+        res.setHeader('X-XSS-Protection', '1; mode=block');
+        next();
+    });
 
     app.use(cors({
         origin: '*',
@@ -520,14 +951,14 @@ async function start() {
             const token = auth.replace("Bearer ", "");
 
             if (!token || blacklist.has(token)) {
-                return { user: null };
+                return { user: null, req };
             }
 
             try {
                 const decoded = jwt.verify(token, JWT_SECRET);
-                return { user: decoded };
+                return { user: decoded, req };
             } catch {
-                return { user: null };
+                return { user: null, req };
             }
         }
     });
@@ -535,8 +966,9 @@ async function start() {
     await server.start();
     server.applyMiddleware({ app, path: "/graphql" });
 
-    app.listen(8092, () => {
-        console.log("Servidor GraphQL en puerto 8092");
+    const PORT = process.env.PORT || 8092;
+    app.listen(PORT, () => {
+        console.log(`Servidor GraphQL en puerto ${PORT}`);
     });
 }
 
